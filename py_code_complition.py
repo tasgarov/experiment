@@ -149,13 +149,18 @@ def _(get_batch, train_tensor):
 def _(F, nn, torch):
     class BigramLanguageModel(nn.Module):
 
-        def __init__(self, vocab_size):
+        def __init__(self, vocab_size, block_size, n_embd):
             super().__init__()
-            self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)
+            self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+            self.pos_embedding = nn.Linear(block_size, n_embd)
+            self.lm_head = nn.Linear(n_embd, vocab_size)
+            self.block_size = block_size
 
         def forward(self, idx, targets=None):
-
-            logits = self.token_embedding_table(idx) # (B,T,C)
+            token_embd = self.token_embedding_table(idx) # (B,T,C)
+            pos_embd = self.pos_embedding(torch.arange(self.block_size, dtype=torch.float))
+            x = token_embd + pos_embd
+            logits = self.lm_head(x)
 
             if targets is None:
                 loss = None
@@ -181,7 +186,7 @@ def _(F, nn, torch):
 
 @app.cell
 def _(BigramLanguageModel, vocab_mapping):
-    bi_model = BigramLanguageModel(vocab_size=len(vocab_mapping))
+    bi_model = BigramLanguageModel(vocab_size=len(vocab_mapping), block_size=32, n_embd=64)
     bi_model
     return (bi_model,)
 
@@ -201,23 +206,25 @@ def _(bi_model, ende_code, torch):
 
 
 @app.cell
-def _(bi_model, torch):
-    optimizer = torch.optim.AdamW(bi_model.parameters(), lr=1e-3)
-    return (optimizer,)
+def _(get_batch, torch):
+    def train(model, train_tensor, block_size: int, batch_size: int, epochs: int):
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        batch_size = batch_size
+        for steps in range(epochs):
+    
+            xb, yb = get_batch(tensor_data=train_tensor, batch_size=batch_size, block_size=block_size)
+    
+            train_logits, train_loss = model(xb, yb)
+            optimizer.zero_grad(set_to_none=True)
+            train_loss.backward(retain_graph=True)
+            optimizer.step()
+        return train_loss
+    return (train,)
 
 
 @app.cell
-def _(bi_model, get_batch, optimizer, train_tensor):
-    batch_size = 256
-    for steps in range(10_000):
-
-        xb, yb = get_batch(tensor_data=train_tensor, batch_size=batch_size, block_size=8)
-
-        train_logits, train_loss = bi_model(xb, yb)
-        optimizer.zero_grad(set_to_none=True)
-        train_loss.backward(retain_graph=True)
-        optimizer.step()
-
+def _(bi_model, train, train_tensor):
+    train_loss = train(model=bi_model, train_tensor=train_tensor, block_size=32, batch_size=64, epochs=1000)
     print(train_loss.item())
     return
 
@@ -229,8 +236,145 @@ def _(bi_model, ende_code, torch):
 
 
 @app.cell
-def _(bi_model, ende_code, torch):
-    print(ende_code.decode(bi_model.generate(idx = torch.zeros((1, 1), dtype=torch.long), max_new_tokens=100)[0].tolist()))
+def _(F, nn, torch):
+    class AttentionHead(nn.Module):
+        def __init__(self, head_size, n_embd, block_size):
+            super().__init__()
+            self.to_key = nn.Linear(n_embd, head_size, bias=False)
+            self.to_query = nn.Linear(n_embd, head_size, bias=False)
+            self.to_value = nn.Linear(n_embd, head_size, bias=False)
+        
+            self.head_size = head_size
+            self.tril = torch.tril(torch.ones(block_size, block_size))
+
+        def forward(self, x):
+            B, T, C = x.shape
+            k = self.to_key(x)
+            q = self.to_query(x)
+            v = self.to_value(x)
+
+            W = q @ k.transpose(-2, -1) / self.head_size ** 0.5
+            W = W.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
+            W = F.softmax(W, dim=-1)
+
+            y = W @ v
+            return y
+
+    return (AttentionHead,)
+
+
+@app.cell
+def _(AttentionHead, F, nn, torch):
+    class BigramAttentionLanguageModel(nn.Module):
+
+        def __init__(self, vocab_size, head_size, block_size, n_embd):
+            super().__init__()
+            self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+            self.pos_embedding = nn.Linear(block_size, n_embd)
+            self.sa_head = AttentionHead(head_size=head_size, n_embd=n_embd, block_size=block_size)
+            self.lm_head = nn.Linear(n_embd, vocab_size)
+
+            self.block_size = block_size
+
+        def forward(self, idx, targets=None):
+            token_embd = self.token_embedding_table(idx) # (B,T,C)
+            pos_embd = self.pos_embedding(torch.arange(self.block_size, dtype=torch.float))
+            x = token_embd + pos_embd
+            x = self.sa_head(x)
+            logits = self.lm_head(x)
+
+            if targets is None:
+                loss = None
+            else:
+                B, T, C = logits.shape
+                logits = logits.view(B*T, C)
+                targets = targets.view(B*T)
+                loss = F.cross_entropy(logits, targets)
+
+            return logits, loss
+
+        def generate(self, idx, max_new_tokens):
+            # idx is (B, T) array of indices in the current context
+            for _ in range(max_new_tokens):
+                idx_cond = idx[:, -self.block_size:]
+                logits, loss = self(idx_cond)
+                logits = logits[:, -1, :]
+                probs = F.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
+                idx = torch.cat((idx, idx_next), dim=1)
+            return idx
+    return (BigramAttentionLanguageModel,)
+
+
+@app.cell
+def _(BigramAttentionLanguageModel, vocab_mapping):
+    bi_attention_model = BigramAttentionLanguageModel(vocab_size=len(vocab_mapping), head_size=64, block_size=32, n_embd=64)
+    bi_attention_model
+    return (bi_attention_model,)
+
+
+@app.cell
+def _(bi_attention_model, train, train_tensor):
+    train_loss2 = train(model=bi_attention_model, train_tensor=train_tensor, block_size=32, batch_size=64, epochs=100)
+    print(train_loss2.item())
+    return
+
+
+@app.cell
+def _(bi_attention_model, ende_code, torch):
+    print(ende_code.decode(bi_attention_model.generate(idx = torch.zeros((1, 1), dtype=torch.long), max_new_tokens=100)[0].tolist()))
+    return
+
+
+@app.cell
+def _(AttentionHead, F, block_size, nn, torch):
+    class MultiHeadAttention(nn.Module):
+        def __init__(self, num_heads, head_size):
+
+            super().__init__()
+            self.heads = [nn.ModuleList((AttentionHead(block_size=block_size, head_size=head_size))) for _ in range(num_heads)]
+
+        def forward(self, x):
+            return torch.cat([h(x) for h in self.heads], dim=-1)
+
+    class BigramMultiHeadAttentionLanguageModel(nn.Module):
+
+        def __init__(self, vocab_size, head_size, block_size, n_embd):
+            super().__init__()
+            self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+            self.pos_embedding = nn.Linear(block_size, n_embd)
+            self.sa_head = MultiHeadAttention()
+            self.lm_head = nn.Linear(n_embd, vocab_size)
+
+            self.block_size = block_size
+
+        def forward(self, idx, targets=None):
+            token_embd = self.token_embedding_table(idx) # (B,T,C)
+            pos_embd = self.pos_embedding(torch.arange(self.block_size, dtype=torch.float))
+            x = token_embd + pos_embd
+            x = self.sa_head(x)
+            logits = self.lm_head(x)
+
+            if targets is None:
+                loss = None
+            else:
+                B, T, C = logits.shape
+                logits = logits.view(B*T, C)
+                targets = targets.view(B*T)
+                loss = F.cross_entropy(logits, targets)
+
+            return logits, loss
+
+        def generate(self, idx, max_new_tokens):
+            # idx is (B, T) array of indices in the current context
+            for _ in range(max_new_tokens):
+                idx_cond = idx[:, -self.block_size:]
+                logits, loss = self(idx_cond)
+                logits = logits[:, -1, :]
+                probs = F.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
+                idx = torch.cat((idx, idx_next), dim=1)
+            return idx
     return
 
 
