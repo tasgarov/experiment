@@ -8,6 +8,7 @@ app = marimo.App(width="full")
 def _():
     import marimo as mo
     import polars
+
     return
 
 
@@ -70,7 +71,7 @@ def _(Wk, Wq, Wv, x):
 
 @app.cell
 def _(k, q, torch):
-    W_raw = torch.bmm(q, k.transpose(1, 2)) / 5 ** 0.5
+    W_raw = torch.bmm(q, k.transpose(1, 2)) / 5**0.5
     W_raw
     return (W_raw,)
 
@@ -123,33 +124,29 @@ def _(F, nn, torch):
             y = self.unifyheads(y)
             return y
 
-        
     return (SelfAttention,)
 
 
 @app.cell
 def _(SelfAttention, nn):
     class TransformerBlock(nn.Module):
-      def __init__(self, k, heads):
-        super().__init__()
+        def __init__(self, k, heads):
+            super().__init__()
 
-        self.attention = SelfAttention(k, heads=heads)
+            self.attention = SelfAttention(k, heads=heads)
 
-        self.norm1 = nn.LayerNorm(k)
-        self.norm2 = nn.LayerNorm(k)
+            self.norm1 = nn.LayerNorm(k)
+            self.norm2 = nn.LayerNorm(k)
 
-        self.ff = nn.Sequential(
-          nn.Linear(k, 4 * k),
-          nn.ReLU(),
-          nn.Linear(4 * k, k)
-        )
+            self.ff = nn.Sequential(nn.Linear(k, 4 * k), nn.ReLU(), nn.Linear(4 * k, k))
 
-      def forward(self, x):
-        attention_layer = self.attention(x)
-        x = self.norm1(attention_layer + x)
+        def forward(self, x):
+            attention_layer = self.attention(x)
+            x = self.norm1(attention_layer + x)
 
-        ff_layer = self.ff(x)
-        return self.norm2(ff_layer + x)
+            ff_layer = self.ff(x)
+            return self.norm2(ff_layer + x)
+
     return
 
 
@@ -191,7 +188,7 @@ app._unparsable_cell(
             x = self.toprobs(x.mean(dim=1))
             return F.log_softmax(x, dim=1)
     """,
-    name="_"
+    name="_",
 )
 
 
